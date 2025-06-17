@@ -118,9 +118,6 @@ public protocol CancellableContext: ScopedContext {
     
     /// Cancel this context with a reason
     func cancel(reason: Reason)
-    
-    /// Reason to use when task is cancelled externally
-    static var taskCancellationReason: Reason { get }
 }
 ```
 
@@ -142,8 +139,6 @@ public struct TimeoutContext: CancellableContext {
     public var remaining: Duration { get }
     
     public func cancel(reason: Reason) { ... }
-    
-    public static var taskCancellationReason: Reason { .deadline }
 }
 
 /// Resource limit cancellation scope  
@@ -168,8 +163,6 @@ public struct ResourceLimitContext: CancellableContext {
     public var currentUsage: Double { get }
     
     public func cancel(reason: Reason) { ... }
-    
-    public static var taskCancellationReason: Reason { .systemPressure }
 }
 
 /// Manual cancellation scope
@@ -185,8 +178,6 @@ public struct CancellationContext: CancellableContext {
     public var reason: Reason? { get }
     
     public func cancel(reason: Reason) { ... }
-    
-    public static var taskCancellationReason: Reason { .userInitiated }
 }
 ```
 
@@ -220,7 +211,7 @@ Each cancellation scope:
 2. Monitors its specific cancellation condition
 3. Propagates cancellation to child tasks when triggered
 4. Provides context-specific information to the operation
-5. Observes external task cancellation and updates accordingly
+5. Maintains its own cancellation state independent of external task cancellation
 
 ```swift
 public func withTimeout<T>(
@@ -229,30 +220,26 @@ public func withTimeout<T>(
 ) async rethrows -> T {
     let context = TimeoutContext(config: .init(duration: timeout))
     
-    return try await withTaskCancellationHandler {
-        try await withThrowingTaskGroup(of: T.self) { group in
-            // Add timeout task
-            group.addTask {
-                try await Task.sleep(for: timeout)
-                context.cancel(reason: .deadline)
-                throw CancellationError()
-            }
-            
-            // Add operation task
-            group.addTask {
-                // Make context available to child tasks via task-local
-                try await TimeoutContext.$current.withValue(context) {
-                    try await operation(context)
-                }
-            }
-            
-            // Return first to complete (operation or timeout)
-            let result = try await group.next()!
-            group.cancelAll()
-            return result
+    return try await withThrowingTaskGroup(of: T.self) { group in
+        // Add timeout task
+        group.addTask {
+            try await Task.sleep(for: timeout)
+            context.cancel(reason: .deadline)
+            throw CancellationError()
         }
-    } onCancel: {
-        context.cancel(reason: TimeoutContext.taskCancellationReason)
+        
+        // Add operation task
+        group.addTask {
+            // Make context available to child tasks via task-local
+            try await TimeoutContext.$current.withValue(context) {
+                try await operation(context)
+            }
+        }
+        
+        // Return first to complete (operation or timeout)
+        let result = try await group.next()!
+        group.cancelAll()
+        return result
     }
 }
 ```
@@ -309,7 +296,7 @@ func someFunction() async {
 
 ### Task Cancellation
 
-Scoped contexts integrate seamlessly with existing task cancellation. When a task is cancelled externally (via `task.cancel()`), the cancellation handler ensures the context is updated accordingly:
+Scoped contexts maintain their own cancellation state independently from task cancellation. When a task is cancelled externally (via `task.cancel()`), only `Task.isCancelled` becomes true, while context-specific cancellation remains separate:
 
 ```swift
 extension Task {
@@ -329,19 +316,30 @@ extension Task {
 }
 ```
 
-This ensures coherent behavior:
+This ensures proper separation of concerns:
 
 ```swift
 let task = Task {
     await withTimeout(.seconds(30)) { timeout in
-        // Both cancellations work together:
-        // If timeout expires: timeout.isCancelled = true, reason = .deadline
-        // If task.cancel() called: timeout.isCancelled = true, reason = .deadline
-        // Task.isCancelled and timeout.isCancelled remain coherent
+        // Cancellation states are independent:
+        // - If timeout expires: timeout.isCancelled = true, reason = .deadline
+        // - If task.cancel() called: Task.isCancelled = true, but timeout.isCancelled = false, reason = nil
+        // - Each cancellation mechanism tracks its own state
+        
+        if Task.isCancelled {
+            // External cancellation
+            throw CancellationError()
+        }
+        
+        if timeout.isCancelled {
+            // Timeout-specific cancellation
+            try await savePartialProgress()
+            throw TimeoutError()
+        }
     }
 }
 
-// External cancellation flows through the context
+// External cancellation doesn't affect timeout context state
 task.cancel()
 ```
 
@@ -457,8 +455,6 @@ struct NetworkConditionContext: CancellableContext {
     var currentCondition: NetworkCondition { get }
     
     func cancel(reason: Reason) { ... }
-    
-    static var taskCancellationReason: Reason { .offline }
 }
 
 func withNetworkCondition<T>(
